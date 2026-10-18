@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run ruff check src tests
+
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: uv run pytest -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Smoke-test the wheel with uvx (MCP handshake over stdio)
+        env:
+          XTREAM_SERVER: http://127.0.0.1:9
+          XTREAM_USERNAME: ci
+          XTREAM_PASSWORD: ci
+        run: |
+          uv run --with fastmcp python - <<'PY'
+          import asyncio, glob
+          from fastmcp import Client
+          from fastmcp.client.transports import StdioTransport
+
+          wheel = glob.glob("dist/*.whl")[0]
+          transport = StdioTransport(command="uvx", args=["--from", wheel, "mcp-xtream"])
+
+          async def main():
+              async with Client(transport) as client:
+                  names = sorted(t.name for t in await client.list_tools())
+                  print("tools:", names)
+                  assert "download_programme" in names and "programme_details" in names
+
+          asyncio.run(main())
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
