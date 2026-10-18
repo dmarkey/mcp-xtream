@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import datetime, timedelta
 from importlib.metadata import PackageNotFoundError, version
 from typing import Literal
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.lifespan import lifespan
 
 from . import downloader
 from .client import XtreamClient, XtreamError
 from .config import ConfigError, load_credentials
 from .data import Channel, DataStore, fmt_time, local_tz, shifted
 from .epg import Programme
+from .events import EventHub
 
 INSTRUCTIONS = """\
 Search an IPTV provider's TV guide (EPG) and download past programmes via
@@ -30,6 +33,10 @@ Notes:
 - The account allows a limited number of simultaneous connections; a
   download uses one, so it may stop the user's TV playback (and vice versa).
 - Times are shown in the user's local timezone.
+- Clients that support server-push events can call subscribe_events once
+  after connecting; they're then told when each download finishes, fails or
+  is cancelled (MCP log notifications with logger="events"), so there's no
+  need to poll download_status.
 
 Episode numbers (for Jellyfin/Plex) are YOUR job, and best effort:
 - The guide has no season/episode data, and repeats air long after their
@@ -50,7 +57,22 @@ try:
 except PackageNotFoundError:  # running from a source tree without install
     _VERSION = "0.0.0"
 
-mcp = FastMCP("Xtream IPTV", instructions=INSTRUCTIONS, version=_VERSION)
+_events: EventHub | None = None
+
+
+@lifespan
+async def _app_lifespan(server):
+    """Run the download-event poller for the life of the server."""
+    global _events
+    _events = EventHub()
+    task = asyncio.create_task(_events.run())
+    try:
+        yield {}
+    finally:
+        task.cancel()
+
+
+mcp = FastMCP("Xtream IPTV", instructions=INSTRUCTIONS, version=_VERSION, lifespan=_app_lifespan)
 
 _store: DataStore | None = None
 
@@ -134,6 +156,34 @@ def _parse_local(value: str) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=local_tz())
     return int(dt.timestamp())
+
+
+def _client_name(ctx: Context) -> str:
+    """Stable identity for the connected client, so subscriptions survive a
+    reconnect (a new session for the same client takes over delivery)."""
+    try:
+        return ctx.session.client_params.clientInfo.name or "unknown"  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+@mcp.tool
+async def subscribe_events(ctx: Context) -> str:
+    """Register this session for server-push download events.
+
+    Call once after connecting (and again after reconnecting; repeat calls are
+    harmless). When a download finishes, fails or is cancelled, the server
+    pushes an MCP log notification with logger="events" and a payload like
+    {"event": "download_finished", "title": ..., "output": ..., "message": ...}.
+    The first subscription from a client covers downloads that end from then
+    on; later ones also catch up on any that ended while disconnected.
+    Requires a persistent session (stdio).
+    """
+    if _events is None:
+        raise ToolError("Events aren't available (server lifespan not running)")
+    _events.subscribe(_client_name(ctx), ctx.session)
+    return ("Subscribed: download_finished / download_failed / download_cancelled events "
+            "will be delivered to this session as log notifications (logger='events').")
 
 
 @mcp.tool

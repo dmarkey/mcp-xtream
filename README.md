@@ -36,6 +36,9 @@ Other things to ask:
   "+1" channels that reuse the main channel's guide, duplicated or overlapping
   guide entries, and guides that only reach a day back (past programmes are
   kept for 7 days so the whole catchup window stays searchable).
+- **Tells you when a download is done**: clients that support server-push
+  events get a `download_finished` / `download_failed` notification instead of
+  having to poll.
 - **Respects your connection limit**: won't start a download while all of
   your account's connections are in use (e.g. you're watching TV).
 - **Keeps your password private**: stream URLs contain it, so no tool ever
@@ -118,8 +121,33 @@ shell profile instead and leave them out of the MCP config.
 | `programme_details` | Full description, air times and channels for one programme, for identifying the episode |
 | `download_programme` | Download a past programme in the background, optionally named for Jellyfin/Plex |
 | `download_status` / `list_downloads` / `cancel_download` | Track and manage downloads |
+| `subscribe_events` | Get pushed a notification when each download finishes, fails or is cancelled |
 | `account_info` | Subscription status, expiry, connection limit, active connections |
 | `refresh_data` | Re-fetch the channel list and guide now |
+
+## Download notifications
+
+Clients that support server-push events can call `subscribe_events` once after
+connecting. Each download that ends is then announced as an MCP log
+notification with `logger="events"`:
+
+```json
+{"event": "download_finished", "job_id": "c7cba935dee2", "title": "Sunday Politics",
+ "channel": "IRL: BBC ONE NORTHERN 4K", "output": "/media/tv/Sunday Politics/Sunday Politics - 2026-10-18.mkv",
+ "size_mb": 1288.6, "message": "Download finished: 'Sunday Politics' (1.3 GB) saved to …"}
+```
+
+`download_failed` (with `error`) and `download_cancelled` work the same way.
+Announcements are tracked per client on disk, so a download that ends while
+the server is restarting is still announced when the client resubscribes.
+For [markeybot](https://github.com/dmarkey/markeybot), set `"events": true` on
+the server entry and it subscribes automatically.
+
+Note: MCP's logging capability, which these notifications ride on, is marked
+deprecated in the 2026-07-28 spec (SEP-2577). Clients that still deliver log
+notifications (the MCP Python SDK's `ClientSession` with a `logging_callback`,
+markeybot) work; others just won't see the events, and `download_status` still
+works for everyone.
 
 ## Episode numbers are best effort (and the assistant's job)
 
