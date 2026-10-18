@@ -505,3 +505,12 @@ def test_r3_tz_absolute_path(monkeypatch):
     monkeypatch.delenv("XTREAM_TZ", raising=False)
     monkeypatch.setenv("TZ", "/usr/share/zoneinfo/America/New_York")
     assert str(timeutil.local_tz()) == "America/New_York"
+
+
+def test_404_messages_distinguish_recent_from_missing():
+    job = downloader.new_job(**_job_kwargs(start=int(time.time()) - 3600, stop=int(time.time()) - 1800))
+    recent = downloader.Worker(job)._http_error(404)
+    assert isinstance(recent, downloader._HttpClientError) and "try again later" in str(recent)
+    old = downloader.Worker(downloader.new_job(**_job_kwargs()))._http_error(404)
+    assert "another channel" in str(old)
+    assert not isinstance(downloader.Worker(job)._http_error(503), downloader._HttpClientError)

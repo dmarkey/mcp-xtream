@@ -387,7 +387,9 @@ def download_programme(
     channel_schedule), or give start/end as ISO local datetimes
     (e.g. 2026-10-18T10:00) plus a title. format 'mkv' remuxes with ffmpeg
     (no re-encode, keeps subtitles); falls back to .ts if ffmpeg is missing.
-    force=True skips the free-connection check.
+    force=True skips the free-connection check. Providers often take a few
+    hours after a programme ends to make its recording available; a
+    "not ready yet" failure means try again later.
 
     Media-server naming (optional): give show (the series name as your media
     server knows it) to save as Jellyfin/Plex TV layout with an .nfo file:

@@ -387,6 +387,15 @@ class _Cancelled(Exception):
     pass
 
 
+class _HttpClientError(RuntimeError):
+    """A 4xx from the provider: retrying won't help."""
+
+
+# Providers archive catchup with a delay; a 404 this soon after a programme
+# ends most likely means "not ready yet" rather than "doesn't exist".
+RECENT_SECONDS = 6 * 3600
+
+
 class Worker:
     def __init__(self, job: dict):
         self.job = job
@@ -426,6 +435,22 @@ class Worker:
             message = str(e) or type(e).__name__
             self._save(state="failed", error=creds.redact(message) if creds else message)
             raise
+
+    def _http_error(self, status: int) -> Exception:
+        if status == 404:
+            if time.time() - self.job["stop"] < RECENT_SECONDS:
+                return _HttpClientError(
+                    "The provider has no catchup recording for this yet (HTTP 404). It "
+                    "ended recently, and providers often take a few hours to make "
+                    "recordings available, so try again later."
+                )
+            return _HttpClientError(
+                "The provider has no catchup recording for this slot (HTTP 404); "
+                "try another channel that carries the programme."
+            )
+        if 400 <= status < 500:
+            return _HttpClientError(f"Server returned HTTP {status}")
+        return RuntimeError(f"Server returned HTTP {status}")
 
     def _catchup_url(self, creds) -> str:
         job = self.job
@@ -480,12 +505,12 @@ class Worker:
                             length = resp.headers.get("content-length")
                             total = int(length) if length else None
                         else:
-                            raise RuntimeError(f"Server returned HTTP {resp.status_code}")
+                            raise self._http_error(resp.status_code)
                         verifying = False
                         self._save(bytes_total=total)
                         self._stream_body(resp)
                 except (httpx.HTTPError, RuntimeError) as e:
-                    if isinstance(e, RuntimeError) and "HTTP 4" in str(e):
+                    if isinstance(e, _HttpClientError):
                         raise
                     failures = 0 if self.server_pos - progress_at_start > 1_000_000 else failures + 1
                     if failures > MAX_RETRIES:
