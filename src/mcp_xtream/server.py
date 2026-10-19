@@ -21,8 +21,21 @@ from .events import EventHub
 
 INSTRUCTIONS = """\
 Search an IPTV provider's TV guide (EPG) and download past programmes via
-catchup. Typical flow: search_programmes -> pick a channel that has
-catchup_available -> download_programme -> download_status.
+catchup. Typical flow: search_programmes -> pick a channel whose
+catchup_status is "in_window" -> (optionally check_recording) ->
+download_programme -> download_status.
+
+Catch-up is per channel and never guaranteed:
+- Every channel stays listed (for live TV); catchup_status says whether a
+  programme on that channel *should* be downloadable: in_window (advertised
+  as available), just_aired (ended in the last few hours; the provider may
+  not have the recording yet), expired, airing, not_aired_yet, or no_catchup
+  (the channel has no archive). Channels are listed best bet first.
+- The advertised window is a hint, not a guarantee: a channel's recording
+  can be missing while another channel carrying the same programme has it.
+  check_recording asks the provider directly (cheap, but briefly uses a
+  connection). If a download fails as not found, try another channel from
+  programme_details / search results before giving up.
 
 Notes:
 - Several channels often share one guide (same epg_id). Provider channel
@@ -109,8 +122,36 @@ def _parse_programme_id(pid: str) -> tuple[str, int]:
     return epg_id, int(start)
 
 
-def _catchup_available(ch: Channel, prog: Programme, now: float) -> bool:
-    return bool(ch.catchup_days) and prog.stop <= now and prog.start >= now - ch.catchup_days * 86400
+# Best bet first when listing a programme's channels.
+CATCHUP_RANK = {"in_window": 0, "just_aired": 1, "airing": 2, "not_aired_yet": 3,
+                "expired": 4, "no_catchup": 5}
+
+
+def _catchup_status(ch: Channel, airing: Programme, now: float) -> str:
+    """How likely this channel's recording of `airing` is downloadable now,
+    from the advertised archive window (a hint; check_recording confirms)."""
+    if not ch.catchup_days:
+        return "no_catchup"
+    if airing.start > now:
+        return "not_aired_yet"
+    if airing.stop > now:
+        return "airing"
+    if airing.start < now - ch.catchup_days * 86400:
+        return "expired"
+    if now - airing.stop < downloader.RECENT_SECONDS:
+        return "just_aired"
+    return "in_window"
+
+
+def _add_catchup(entry: dict, ch: Channel, airing: Programme, now: float) -> dict:
+    status = _catchup_status(ch, airing, now)
+    entry["catchup_status"] = status
+    entry["catchup_available"] = status in ("in_window", "just_aired")
+    return entry
+
+
+def _best_first(chans: list[dict]) -> list[dict]:
+    return sorted(chans, key=lambda c: CATCHUP_RANK[c["catchup_status"]])
 
 
 def _status(prog: Programme, now: float) -> str:
@@ -167,6 +208,43 @@ def _client_name(ctx: Context) -> str:
         return "unknown"
 
 
+def _channel_programme(s: DataStore, stream_id: int, programme_id: str) -> tuple[Channel, Programme, Programme]:
+    """(channel, guide programme, airing on this channel) for a programme_id."""
+    ch = s.by_stream.get(stream_id)
+    if ch is None:
+        raise ToolError(f"No channel with stream_id {stream_id}")
+    epg_id, start_ts = _parse_programme_id(programme_id)
+    prog = s.find_programme(epg_id, start_ts)
+    if prog is None:
+        raise ToolError("programme_id not found in the guide (try refresh_data)")
+    if epg_id != ch.epg_id:
+        raise ToolError(
+            f"That programme is from guide '{epg_id}', but '{ch.name}' uses "
+            f"'{ch.epg_id or 'none'}'. Pick a channel listed with the programme."
+        )
+    return ch, prog, shifted(prog, ch.epg_shift)  # a +1 channel airs it an hour later
+
+
+def _require_free_connection(s: DataStore) -> None:
+    """Refuse to open a stream when every connection on the account is in use
+    (usually the user watching TV), since ours would knock theirs off."""
+    try:
+        with XtreamClient(s.creds) as client:
+            user = client.authenticate().get("user_info") or {}
+    except XtreamError as e:
+        raise ToolError(str(e)) from None
+    try:
+        active_cons = int(user.get("active_cons") or 0)
+        max_cons = int(user.get("max_connections") or 0)
+    except ValueError:
+        active_cons, max_cons = 0, 0
+    if max_cons and active_cons >= max_cons:
+        raise ToolError(
+            f"All {max_cons} connection(s) are in use (probably TV playback). "
+            "Stop playback first, or pass force=True to try anyway."
+        )
+
+
 @mcp.tool
 async def subscribe_events(ctx: Context) -> str:
     """Register this session for server-push download events.
@@ -209,8 +287,9 @@ def account_info() -> dict:
 @mcp.tool
 def list_channels(query: str = "", catchup_only: bool = False, limit: int = 30) -> dict:
     """Find live channels by name or category (case-insensitive; all words must
-    match). Each result includes stream_id, epg_id, catchup_days and what's on
-    now."""
+    match). Each result includes stream_id, epg_id, catchup_days (0 = no
+    catch-up archive; still fine for live TV) and what's on now. catchup_only
+    keeps just channels with an archive."""
     s = store()
     words = query.lower().split()
     now = time.time()
@@ -243,8 +322,10 @@ def search_programmes(
 
     channel: optional channel-name filter (e.g. "bbc one"). The window is
     hours_back before now to hours_ahead after. Each result lists every
-    channel carrying that guide entry, with catchup_available telling you
-    whether it can be downloaded now. Results are newest first.
+    channel carrying that guide entry, best catch-up bet first, each with a
+    catchup_status (see server instructions) and catchup_available (true for
+    in_window / just_aired). catchup_only keeps only channels where it's
+    true, and drops programmes with none. Results are newest first.
     """
     s = store()
     now = time.time()
@@ -286,10 +367,10 @@ def search_programmes(
                 airing = shifted(prog, ch.epg_shift)
                 if ch.epg_shift:
                     entry["start"], entry["end"] = fmt_time(airing.start), fmt_time(airing.stop)
-                entry["catchup_available"] = _catchup_available(ch, airing, now)
-                chans.append(entry)
+                chans.append(_add_catchup(entry, ch, airing, now))
             if catchup_only:
                 chans = [c for c in chans if c["catchup_available"]]
+            chans = _best_first(chans)
             if not chans:
                 continue
             item = _programme_dict(epg_id, prog, now, search_descriptions)
@@ -329,7 +410,7 @@ def channel_schedule(stream_id: int, date: str = "today", include_descriptions: 
         if p.stop <= day_start or p.start >= day_end:
             continue
         item = _programme_dict(ch.epg_id, p, now, include_descriptions, ch.epg_shift)
-        item["catchup_available"] = _catchup_available(ch, p, now)
+        _add_catchup(item, ch, p, now)
         progs.append(item)
     return _with_warnings({"channel": _channel_dict(ch), "date": day.isoformat(), "programmes": progs})
 
@@ -356,14 +437,64 @@ def programme_details(programme_id: str) -> dict:
         entry = _channel_dict(ch)
         airing = shifted(prog, ch.epg_shift)
         entry["start"], entry["end"] = fmt_time(airing.start), fmt_time(airing.stop)
-        entry["catchup_available"] = _catchup_available(ch, airing, now)
-        chans.append(entry)
-    out["channels"] = chans
+        chans.append(_add_catchup(entry, ch, airing, now))
+    out["channels"] = _best_first(chans)
     out["episode_numbering"] = (
         "Not in the guide. Identify it from the description (best effort) and pass "
         "show/season/episode to download_programme."
     )
     return _with_warnings(out)
+
+
+@mcp.tool
+def check_recording(stream_id: int, programme_id: str, force: bool = False) -> dict:
+    """Ask the provider whether this channel's catch-up recording of a
+    programme exists right now (the advertised window is only a hint).
+
+    Opens the recording briefly (a 1 KB request) and reports whether it's
+    there and how big it is. That uses one of the account's connections for
+    a moment, so it refuses while they're all in use (e.g. the user is
+    watching TV) unless force=True, and while a download is running.
+    """
+    s = store()
+    ch, prog, airing = _channel_programme(s, stream_id, programme_id)
+    now = time.time()
+    status = _catchup_status(ch, airing, now)
+    result = {"stream_id": stream_id, "channel": ch.name, "title": prog.title,
+              "start": fmt_time(airing.start), "catchup_status": status}
+    if status not in ("in_window", "just_aired"):
+        reason = {"no_catchup": "this channel has no catch-up archive",
+                  "not_aired_yet": "it hasn't aired yet", "airing": "it's still airing",
+                  "expired": f"it's older than the channel's {ch.catchup_days}-day archive"}[status]
+        return {**result, "available": False, "message": f"Not checked: {reason}."}
+    with downloader.spawn_lock():
+        if active := downloader.active_job():
+            raise ToolError(
+                f"Download {active['id']} ('{active['title']}') is using the connection; "
+                "check again when it's done"
+            )
+        if not force:
+            _require_free_connection(s)
+        with XtreamClient(s.creds) as client:
+            minutes = max(1, -(-(airing.stop - airing.start) // 60))
+            url = client.catchup_url(stream_id, airing.start, minutes, s.server_tz, s.server_offset)
+            try:
+                http_status, size = client.probe_recording(url)
+            except XtreamError as e:
+                raise ToolError(str(e)) from None
+    available = http_status in (200, 206)
+    if available:
+        message = "Recording is available" + (f" ({size / 1e9:.1f} GB)." if size else ".")
+    elif http_status == 404 and status == "just_aired":
+        message = ("Not available yet (HTTP 404): it ended recently and the provider may still "
+                   "be preparing it. Try again later, or another channel carrying it.")
+    elif http_status == 404:
+        message = ("No recording on this channel (HTTP 404). Try another channel carrying "
+                   "the programme (see programme_details).")
+    else:
+        message = f"Provider answered HTTP {http_status}."
+    return {**result, "available": available, "http_status": http_status,
+            "size_mb": round(size / 1e6, 1) if size else None, "message": message}
 
 
 @mcp.tool
@@ -412,16 +543,7 @@ def download_programme(
         raise ToolError(f"'{ch.name}' has no catchup archive")
 
     if programme_id:
-        epg_id, start_ts = _parse_programme_id(programme_id)
-        prog = s.find_programme(epg_id, start_ts)
-        if prog is None:
-            raise ToolError("programme_id not found in the guide (try refresh_data)")
-        if epg_id != ch.epg_id:
-            raise ToolError(
-                f"That programme is from guide '{epg_id}', but '{ch.name}' uses "
-                f"'{ch.epg_id or 'none'}'. Pick a channel listed with the programme."
-            )
-        airing = shifted(prog, ch.epg_shift)  # a +1 channel airs it an hour later
+        ch, prog, airing = _channel_programme(s, stream_id, programme_id)
         start_ts, stop_ts, prog_title = airing.start, airing.stop, title or prog.title
         description = prog.desc
     elif start and end:
@@ -448,21 +570,7 @@ def download_programme(
                 "wait for it or cancel it first"
             )
         if not force:
-            try:
-                with XtreamClient(s.creds) as client:
-                    user = client.authenticate().get("user_info") or {}
-            except XtreamError as e:
-                raise ToolError(str(e)) from None
-            try:
-                active_cons = int(user.get("active_cons") or 0)
-                max_cons = int(user.get("max_connections") or 0)
-            except ValueError:
-                active_cons, max_cons = 0, 0
-            if max_cons and active_cons >= max_cons:
-                raise ToolError(
-                    f"All {max_cons} connection(s) are in use (probably TV playback). "
-                    "Stop playback first, or pass force=True to try anyway."
-                )
+            _require_free_connection(s)
         layout: dict = {}
         if show:
             folder, stem = downloader.jellyfin_layout(show, season, episode, episode_title, start_ts)

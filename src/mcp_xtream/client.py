@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Self
 from urllib.parse import quote, urlparse, urlunparse
@@ -136,6 +137,22 @@ class XtreamClient:
         if resp.status_code != 200:
             raise XtreamError(f"TV guide download failed: server returned HTTP {resp.status_code}")
         return resp.content
+
+    def probe_recording(self, url: str) -> tuple[int, int | None]:
+        """(HTTP status, total size or None) for a catch-up URL, reading at
+        most 1 KB and closing straight away."""
+        try:
+            with httpx.Client(
+                follow_redirects=True, timeout=20, headers={"User-Agent": STREAM_USER_AGENT}
+            ) as http, http.stream("GET", url, headers={"Range": "bytes=0-1023"}) as resp:
+                total = None
+                if m := re.match(r"bytes \d+-\d+/(\d+)", resp.headers.get("content-range", "")):
+                    total = int(m.group(1))
+                elif resp.status_code == 200 and resp.headers.get("content-length", "").isdigit():
+                    total = int(resp.headers["content-length"])
+                return resp.status_code, total
+        except httpx.HTTPError as e:
+            raise XtreamError(f"Couldn't reach the recording ({describe_http_error(e)})") from None
 
     def catchup_url(
         self,

@@ -118,12 +118,33 @@ shell profile instead and leave them out of the MCP config.
 | `search_programmes` | Search the guide by title (optionally descriptions or channel), past, now or upcoming. Lists every channel carrying each programme and whether catchup is available |
 | `list_channels` | Find channels by name or category, with catchup days and what's on now |
 | `channel_schedule` | One channel's guide for a day |
+| `check_recording` | Ask the provider whether a channel's recording of a programme actually exists right now (briefly uses a connection) |
 | `programme_details` | Full description, air times and channels for one programme, for identifying the episode |
 | `download_programme` | Download a past programme in the background, optionally named for Jellyfin/Plex |
 | `download_status` / `list_downloads` / `cancel_download` | Track and manage downloads |
 | `subscribe_events` | Get pushed a notification when each download finishes, fails or is cancelled |
 | `account_info` | Subscription status, expiry, connection limit, active connections |
 | `refresh_data` | Re-fetch the channel list and guide now |
+
+## Catch-up availability is a hint
+
+Every channel stays listed (channels without catch-up are still useful for
+live TV). Each programme lists the channels carrying it, best bet first, with
+a `catchup_status`:
+
+| Status | Meaning |
+|--------|---------|
+| `in_window` | Within the channel's advertised catch-up window |
+| `just_aired` | Ended in the last few hours; the provider may not have the recording yet |
+| `airing` / `not_aired_yet` | Not finished yet |
+| `expired` | Older than the channel's archive |
+| `no_catchup` | The channel has no archive (live only) |
+
+The advertised window is only a hint: one channel's recording can be missing
+while another channel carrying the same programme has it, and providers
+sometimes lose recordings early. `check_recording` asks the provider directly
+(a 1 KB request, refused while your connections are all in use), and the
+assistant is told to try other channels before giving up.
 
 ## Download notifications
 

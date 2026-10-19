@@ -442,7 +442,8 @@ class Worker:
                 return _HttpClientError(
                     "The provider has no catchup recording for this yet (HTTP 404). It "
                     "ended recently, and providers often take a few hours to make "
-                    "recordings available, so try again later."
+                    "recordings available, so try again later or try another channel "
+                    "carrying the programme."
                 )
             return _HttpClientError(
                 "The provider has no catchup recording for this slot (HTTP 404); "
